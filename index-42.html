@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Super Pio – Testnet Rewards</title>
+<script src="https://sdk.minepi.com/pi-sdk.js"></script>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:linear-gradient(180deg,#1a0a2e,#2d1b4e);color:#fff;
+       font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;justify-content:center}
+  main{width:100%;max-width:420px;padding:28px 20px;text-align:center}
+  h1{margin:8px 0 2px;color:#FFD700;font-size:30px;text-shadow:0 0 18px #FF6B00}
+  .sub{margin:0 0 22px;color:#bbb;font-size:13px}
+  .card{background:rgba(255,255,255,.07);border:2px solid #7b3fd6;border-radius:18px;padding:22px 16px;margin-bottom:16px}
+  .amt{font-size:56px;font-weight:900;color:#FFD700;text-shadow:0 0 20px #FF6B00;line-height:1.1}
+  .note{font-size:12px;color:#aaa;margin:4px 0 14px}
+  button{width:100%;padding:15px;font-size:16px;font-weight:800;border:0;border-radius:14px;cursor:pointer;
+         background:linear-gradient(90deg,#FFD700,#FF8C00);color:#2a1500}
+  button:disabled{opacity:.5;cursor:default}
+  #state{font-size:14px;margin-bottom:14px;min-height:20px}
+  #tx{font-size:11px;color:#9f9;word-break:break-all;margin-top:12px}
+  #log{margin:0;text-align:left;font-size:11px;line-height:1.5;color:#cbb8ff;background:rgba(0,0,0,.35);
+       border-radius:12px;padding:10px;white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>🤠 Super Pio</h1>
+  <p class="sub">Testnet reward · 1 Test-Pi for every new player</p>
+
+  <section class="card" id="loginBox">
+    <p style="margin-top:0;font-size:14px">Sign in with Pi Network to claim your free reward.</p>
+    <button id="loginBtn">🔐 Login with Pi Network</button>
+  </section>
+
+  <section class="card" id="rewardBox" hidden>
+    <div id="who" style="font-size:13px;color:#ddd;margin-bottom:8px"></div>
+    <div class="amt" id="amt">1 π</div>
+    <div class="note">Test-Pi welcome reward</div>
+    <div id="state"></div>
+    <button id="withdrawBtn">Withdraw to my Pi wallet</button>
+    <div id="tx"></div>
+  </section>
+
+  <pre id="log"></pre>
+</main>
+
+<script>
+(function () {
+  var BACKEND = '/.netlify/functions/';
+  var SANDBOX = location.search.indexOf('sandbox=0') === -1;   // الافتراضي: Testnet
+  var $ = function (id) { return document.getElementById(id); };
+  var token = null, user = null, reward = null, busy = false, inited = false;
+
+  function log(m) {
+    var t = new Date().toLocaleTimeString();
+    $('log').textContent += t + '  ' + m + '\n';
+    $('log').scrollTop = 1e6;
+  }
+  function withTimeout(p, ms, msg) {
+    return Promise.race([p, new Promise(function (_, rej) { setTimeout(function () { rej(new Error(msg)); }, ms); })]);
+  }
+  function key() { return 'spio_reward_' + (user ? user.uid : ''); }
+  function loadState() { try { return JSON.parse(localStorage.getItem(key()) || 'null'); } catch (e) { return null; } }
+  function saveState() { try { localStorage.setItem(key(), JSON.stringify(reward)); } catch (e) {} }
+
+  function call(fn, body) {
+    return fetch(BACKEND + fn, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (!r.ok) throw new Error((d.detail || d.error || 'Request failed') + ' (HTTP ' + r.status + ')');
+        return d;
+      });
+    });
+  }
+
+  // دفعة غير مكتملة من محاولة سابقة: ننظّفها عبر pi-payment
+  function onIncomplete(p) {
+    log('Incomplete payment found: ' + p.identifier);
+    var tx = p.transaction && p.transaction.txid;
+    call('pi-payment', { action: tx ? 'complete' : 'cancel', paymentId: p.identifier, txid: tx })
+      .then(function () { log('Incomplete payment cleaned'); })
+      .catch(function (e) { log('Cleanup failed: ' + e.message); });
+  }
+
+  function ensureSdk() {
+    if (typeof Pi !== 'undefined') return Promise.resolve();
+    log('SDK not found, loading it...');
+    return new Promise(function (res) {
+      var s = document.createElement('script');
+      s.src = 'https://sdk.minepi.com/pi-sdk.js';
+      s.onload = res; s.onerror = res; document.head.appendChild(s);
+      setTimeout(res, 8000);
+    }).then(function () {
+      if (typeof Pi === 'undefined') throw new Error('Pi SDK could not be loaded. Open this page in Pi Browser.');
+    });
+  }
+
+  function render() {
+    $('loginBox').hidden = true;
+    $('rewardBox').hidden = false;
+    $('who').textContent = 'π ' + user.username;
+    var done = reward.status === 'withdrawn';
+    $('amt').textContent = (done ? 0 : reward.amount) + ' π';
+    $('state').textContent = done ? '✅ Sent to your Pi wallet' : '🎁 Ready to withdraw';
+    $('withdrawBtn').disabled = done || busy;
+    $('withdrawBtn').textContent = busy ? 'Sending...' : done ? 'Already withdrawn' : 'Withdraw to my Pi wallet';
+    $('tx').textContent = reward.txid ? 'TX: ' + reward.txid : '';
+  }
+
+  function login() {
+    if (busy) return;
+    busy = true; $('loginBtn').disabled = true; $('loginBtn').textContent = '⏳ Connecting to Pi...';
+    ensureSdk().then(function () {
+      log('Pi SDK loaded');
+      if (!inited) { Pi.init({ version: '2.0', sandbox: SANDBOX }); inited = true; }
+      log('Pi.init done · mode: ' + (SANDBOX ? 'Testnet (sandbox)' : 'Mainnet'));
+      return withTimeout(
+        Pi.authenticate(['username', 'payments', 'wallet_address'], onIncomplete), 25000,
+        'Login timed out (25s). Open this page from the Pi Sandbox / Pi Browser and try again.');
+    }).then(function (auth) {
+      token = auth.accessToken; user = auth.user;
+      log('Logged in as ' + user.username);
+      reward = loadState() || { amount: 1, status: 'ready', txid: null };
+      saveState(); busy = false; render();
+    }).catch(function (e) {
+      log('❌ ' + (e && (e.message || e.error) || JSON.stringify(e)));
+      busy = false; $('loginBtn').disabled = false; $('loginBtn').textContent = '🔐 Login with Pi Network';
+    });
+  }
+
+  function withdraw() {
+    if (busy || !token || reward.status === 'withdrawn') return;
+    busy = true; render(); log('Sending 1 Test-Pi to your wallet...');
+    call('pi-reward', { action: 'withdraw', accessToken: token }).then(function (d) {
+      reward = { amount: 1, status: 'withdrawn', txid: d.txid || null };
+      saveState(); log('✅ Done. TX: ' + (d.txid || '-'));
+    }).catch(function (e) {
+      log('❌ ' + e.message);
+    }).then(function () { busy = false; render(); });
+  }
+
+  $('loginBtn').addEventListener('click', login);
+  $('withdrawBtn').addEventListener('click', withdraw);
+  log('Page ready · SDK ' + (typeof Pi !== 'undefined' ? 'loaded' : 'not loaded yet') + ' · mode ' + (SANDBOX ? 'Testnet' : 'Mainnet'));
+})();
+</script>
+</body>
+</html>
